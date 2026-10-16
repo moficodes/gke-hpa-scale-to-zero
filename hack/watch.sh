@@ -99,7 +99,7 @@ render_snapshot() {
   printf -- '--------------------------------------------------------------------------------\n'
   printf 'Job Worker Pods (namespace: %s):\n' "${NAMESPACE}"
   if [[ -z "${pods_out}" ]]; then
-    printf '  (0 pods running — Zero-Scale State)\n'
+    printf '  (0 pods running - Zero-Scale State)\n'
   else
     printf '%s\n' "${pods_out}" | sed 's/^/  /'
     if [[ -n "${latest_log}" ]]; then

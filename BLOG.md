@@ -1,32 +1,39 @@
-# Native HPA scale-to-zero on GKE 1.37 with AutoscalingMetric and Managed Prometheus
+# Scaling Kubernetes deployments to zero on GKE 1.37 without KEDA
 
-Asynchronous worker pools spend a lot of their life waiting for work. Whether you run batch document parsers, webhook consumers, or queue-driven inference workers, keeping `minReplicas: 1` running 24/7 across dozens of microservices wastes cluster capacity when queues are empty.
+Queue workers spend a lot of time doing nothing. If you run batch document parsers, webhook consumers, or background job processors, keeping `minReplicas: 1` alive across dozens of services burns cluster capacity all night just waiting for a message to arrive.
 
-Until recently, scaling a Kubernetes Deployment down to `0` replicas and waking it back up from queue metrics on Google Kubernetes Engine (GKE) meant picking between two operational trade-offs:
+Until now, scaling a Deployment down to zero pods on Google Kubernetes Engine meant picking between two compromises.
 
-1. Installing and maintaining a third-party operator such as KEDA, which brings its own custom resources (`ScaledObject`) and its own metrics server into `kube-system`.
-2. Installing the legacy `custom-metrics-stackdriver-adapter` with Workload Identity bindings and scaling against Cloud Monitoring metrics like Cloud Pub/Sub's `num_undelivered_messages`, which samples every 60 seconds and often takes 60 to 90 seconds before the Horizontal Pod Autoscaler (HPA) even sees a new burst of work.
+You could install KEDA. I like KEDA, and for complex event sources it is still great, but it means running another operator and another metrics API server in `kube-system`, plus teaching every team `ScaledObject` CRDs instead of standard `HorizontalPodAutoscaler` manifests.
 
-With GKE 1.37 (`v1.37.0-gke.3503000`), two built-in capabilities come together so you can run fast scale-to-zero using standard Kubernetes `HorizontalPodAutoscaler` (`autoscaling/v2`) objects and zero third-party operators:
+Or you could wire up `custom-metrics-stackdriver-adapter` with Workload Identity and scale against a Cloud Monitoring metric like Cloud Pub/Sub `num_undelivered_messages`. That works on paper, but Pub/Sub metrics sample every 60 seconds and have up to a 150-second ingestion lag. Waiting two minutes for your first worker pod to wake up feels broken when a user is waiting on a job.
 
-- Upstream Kubernetes `HPAScaleToZero` is enabled on the GKE control plane, allowing `minReplicas: 0` on HPAs that scale on `External` or `Object` metrics.
-- GKE's native `AutoscalingMetric` custom resource (`autoscaling.gke.io/v1beta1`) and managed Autoscaling Metrics Adapter (AMA) (`kube-system/autoscaling-metrics-adapter`) evaluate arbitrary PromQL queries against Google Cloud Managed Service for Prometheus (`PodMonitoring`) and expose the results directly through the Kubernetes External Metrics API.
+GKE 1.37 changes this math. Two native features now work together out of the box:
 
-This guide walks through a complete, zero-build reference stack (`moficodes/gke-hpa-scale-to-zero`) verified on a live GKE `v1.37.0-gke.3503000` cluster (`ate-cluster`). We will look at how the pieces fit together, three subtle production lessons we uncovered while testing on a real cluster, and the exact terminal outputs and second-by-second timings across a `1 -> 0 -> 5 -> 0` scaling cycle.
+- Kubernetes `HPAScaleToZero` is enabled on the GKE control plane, so a standard `autoscaling/v2` HPA can set `minReplicas: 0` whenever it scales on `External` or `Object` metrics.
+- GKE's `AutoscalingMetric` custom resource and managed `autoscaling-metrics-adapter` evaluate arbitrary PromQL queries against Google Cloud Managed Service for Prometheus and feed the result straight into the Kubernetes External Metrics API.
 
-## How GKE native HPA scale-to-zero compares
+I built a small, zero-build repo at [github.com/moficodes/gke-hpa-scale-to-zero](https://github.com/moficodes/gke-hpa-scale-to-zero) to test how fast native GKE scale-to-zero actually reacts on a live `v1.37.0-gke.3503000` cluster. The workload wakes from `0` to `5` running pods in 11 seconds when 100 jobs hit the queue, drains the backlog, and scales cleanly back to `0`.
 
-| Capability | Legacy `custom-metrics-stackdriver-adapter` | KEDA (`ScaledObject`) | GKE 1.37 `AutoscalingMetric` + `minReplicas: 0` |
+Getting there took three tries. Redis, Prometheus, and GKE's HPA controller each have a sharp edge when a workload hits zero replicas, and none of them are obvious until you watch an HPA get stuck on a live cluster.
+
+Below is the full setup so you can run it yourself, followed by the three failure modes I hit and the live cluster trace.
+
+## How the native GKE 1.37 path compares
+
+| Feature | Legacy Stackdriver adapter | KEDA `ScaledObject` | GKE 1.37 `AutoscalingMetric` + `minReplicas: 0` |
 | :--- | :--- | :--- | :--- |
-| Control plane component | Self-managed Deployment in `kube-system` | Self-managed KEDA operator + metrics apiserver | GKE-managed `autoscaling-metrics-adapter` (AMA) |
-| HPA definition | Standard `autoscaling/v2` HPA | Generated and owned by KEDA `ScaledObject` | Standard `autoscaling/v2` HPA (`minReplicas: 0`) |
-| Query language | Cloud Monitoring filters | Scaler-specific YAML triggers | Full PromQL via `AutoscalingMetric` (`autoscaling.gke.io/v1beta1`) |
-| Idle footprint when unused | Adapter pod always running | Operator + adapter pods always running | AMA stays at `0/0` until an `AutoscalingMetric` with `promql` exists |
-| Wake-from-zero reaction time | 60s to 90s+ (Cloud Pub/Sub sampling) | 5s to 15s (direct broker polling) | ~5s to 11s (`5s` `PodMonitoring` scrape + PromQL) |
+| Metrics server in `kube-system` | Self-managed Deployment | Self-managed KEDA operator + adapter | GKE-managed `autoscaling-metrics-adapter` |
+| HPA resource | Standard `autoscaling/v2` HPA | Generated and owned by KEDA | Standard `autoscaling/v2` HPA with `minReplicas: 0` |
+| Query language | Cloud Monitoring filter strings | Scaler-specific YAML triggers | PromQL via `AutoscalingMetric` |
+| Idle footprint when unused | Adapter pod always running | Operator and adapter pods always running | Adapter stays at `0/0` until an `AutoscalingMetric` with `promql` exists |
+| Wake-from-zero reaction time | 60s to 90s+ on Pub/Sub metrics | 5s to 15s | 5s to 11s with a 5s `PodMonitoring` scrape |
 
-## Architecture of the zero-build demo stack
+One detail I appreciated right away is how GKE manages `kube-system/autoscaling-metrics-adapter`. On a fresh GKE 1.37 cluster, that Deployment sits at `0/0` replicas. You pay nothing for it. The moment you apply an `AutoscalingMetric` resource containing a `promql` block, GKE scales the adapter to `1/1` Ready automatically.
 
-To make the scaling loop easy to reproduce in under two minutes without building container images or configuring GCP IAM, the demo runs entirely inside the `hpa-scale-to-zero` namespace using two upstream images (`redis:7-alpine` and `oliver006/redis_exporter:v1.62.0`).
+## What we are building
+
+I wanted a demo anyone could run in two minutes without building container images, creating Cloud Pub/Sub topics, or configuring IAM service accounts. Everything runs inside the `hpa-scale-to-zero` namespace using two upstream images, `redis:7-alpine` and `oliver006/redis_exporter:v1.62.0`.
 
 ```mermaid
 flowchart LR
@@ -41,15 +48,28 @@ flowchart LR
   Worker -->|"RPOP jobs (1 item / 2s)"| Redis
 ```
 
-Here is how data flows from the Redis list to the HPA controller:
+**Redis queue and exporter.** A single Redis pod stores pending work items in a list named `jobs`. A `redis_exporter` sidecar runs in the same pod with `--check-keys=jobs` and exposes the list length `LLEN jobs` on port `9121` as the Prometheus gauge `redis_key_size{key="jobs"}`.
 
-1. **Job Queue (`Deployment/redis-queue`)**: A single-replica Redis instance holds pending items in a Redis list named `jobs`. An `oliver006/redis_exporter:v1.62.0` sidecar runs alongside it with `--check-keys=jobs`, exposing the instantaneous Queue Depth (`LLEN jobs`) on port `9121` as the Prometheus gauge `redis_key_size{key="jobs"}`.
-2. **`PodMonitoring` (`redis-queue-monitoring`)**: Google Cloud Managed Service for Prometheus scrapes the `metrics` port on `redis-queue` every `5s`.
-3. **`AutoscalingMetric` (`redis-queue-depth`)**: A GKE `autoscaling.gke.io/v1beta1` resource evaluates a PromQL query against Managed Service for Prometheus and publishes the result as an External metric named `autoscaling.gke.io|redis-queue-depth|pending-jobs`.
-4. **Autoscaling Metrics Adapter (AMA)**: As soon as `AutoscalingMetric/redis-queue-depth` is applied, GKE's cluster-managed `kube-system/autoscaling-metrics-adapter` Deployment automatically scales from `0` to `1` replica and serves the `external.metrics.k8s.io` API.
-5. **HPA and Job Worker (`job-worker-hpa` and `Deployment/job-worker`)**: The HPA targets an `AverageValue` of `20` pending jobs per pod (`minReplicas: 0`, `maxReplicas: 10`). Each Job Worker pod runs a shell loop (`redis-cli -h redis-queue rpop jobs`) that pops and logs 1 item every 2 seconds.
+**5-second `PodMonitoring`.** Google Cloud Managed Service for Prometheus scrapes the exporter port every `5s`.
 
-### Part 1: The Redis Job Queue and 5-second `PodMonitoring` (`manifests/01-redis-queue.yaml`)
+**`AutoscalingMetric`.** A `redis-queue-depth` custom resource runs a PromQL query against Managed Service for Prometheus and exposes the result to HPA as an external metric named `autoscaling.gke.io|redis-queue-depth|pending-jobs`.
+
+**HPA and worker Deployment.** `job-worker-hpa` targets an `AverageValue` of `20` pending jobs per pod, with `minReplicas: 0` and `maxReplicas: 10`. Each `job-worker` pod runs a tiny shell loop that pops one item from Redis every 2 seconds with `redis-cli -h redis-queue rpop jobs` and logs it to stdout.
+
+## Follow along on your own cluster
+
+If you have a GKE 1.37+ cluster with Managed Service for Prometheus enabled, you can run the whole loop in three commands. If you just want to see what happens, skip ahead to the three production lessons and the captured terminal output.
+
+Clone the repository first:
+
+```bash
+git clone https://github.com/moficodes/gke-hpa-scale-to-zero.git
+cd gke-hpa-scale-to-zero
+```
+
+### Step 1: Apply the manifests
+
+First, look at `manifests/01-redis-queue.yaml`, which sets up the Redis instance, the exporter sidecar, and the 5-second `PodMonitoring` scrape:
 
 ```yaml
 apiVersion: apps/v1
@@ -96,7 +116,7 @@ spec:
       interval: 5s
 ```
 
-### Part 2: `AutoscalingMetric`, Job Worker, and HPA (`manifests/02-worker-and-hpa.yaml`)
+Next is `manifests/02-worker-and-hpa.yaml`, which defines the `AutoscalingMetric`, the worker Deployment, and the HPA with `minReplicas: 0`:
 
 ```yaml
 apiVersion: autoscaling.gke.io/v1beta1
@@ -173,41 +193,73 @@ spec:
           averageValue: "20"
 ```
 
-## Three production lessons from live GKE 1.37 testing
+Deploy both files with `make apply`:
 
-Writing the manifests looks straightforward on paper, but running the full `1 -> 0 -> 5 -> 0` loop against a live GKE 1.37 cluster surfaced three sharp edges that every operator building PromQL-driven scale-to-zero will run into. Each one is captured as an Architecture Decision Record (`docs/adr/`) in this repository.
+```bash
+make apply
+```
 
-### Lesson 1: Redis deletes empty lists, which turns your PromQL metric into `<unknown>` (`ADR-0001`)
+### Step 2: Open the live observer
 
-When you push items into a Redis list with `LPUSH jobs ...`, `redis_exporter --check-keys=jobs` emits:
+In one terminal pane, run `make watch` to refresh the queue depth, adapter status, HPA conditions, and worker pods every 2 seconds, or run `make status` for a single snapshot:
 
-```text
+```bash
+make watch
+```
+
+Within about 45 seconds of `make apply`, the initial worker pod scales down to `0/0` Ready and HPA reports `ScaledToZero=True`.
+
+### Step 3: Push a 100-job burst
+
+In a second terminal, push 100 synthetic jobs into Redis in one `LPUSH` call:
+
+```bash
+make burst JOBS=100
+```
+
+Watch the first terminal as HPA wakes `job-worker` from `0` to `5` pods, drains all 100 items, waits 15 seconds for the scale-down stabilization window, and scales back to `0`. When you are done, delete the namespace with `make clean`:
+
+```bash
+make clean
+```
+
+## Three things that bit me on a live cluster
+
+Looking at `manifests/02-worker-and-hpa.yaml` above, you might wonder why the PromQL query ends with `or vector(0)`, why a scale-to-zero Deployment starts at `replicas: 1`, and why `scaleUp.policies` is explicitly set. Every one of those lines is there because my first attempt broke.
+
+### 1. Redis deletes empty lists, which turns your PromQL metric into `<unknown>`
+
+When you push 100 items into a Redis list with `LPUSH jobs ...`, `redis_exporter --check-keys=jobs` exports the gauge you expect:
+
+```bash
 redis_key_size{db="db0", key="jobs"} 100
 ```
 
-However, the moment the last item is popped (`RPOP jobs` when `LLEN jobs == 1`), Redis automatically deletes the empty `jobs` key. On the very next scrape, `redis_exporter` omits `redis_key_size{key="jobs"}` from `/metrics`. Once the Prometheus lookback window expires, a naive query like:
+The trap springs when a worker pops the last item from the list. In Redis, a list with zero elements does not exist. Redis deletes the `jobs` key immediately when `LLEN jobs` hits zero.
 
-```promql
-max(redis_key_size{namespace="hpa-scale-to-zero", key="jobs"})
+On the next 5-second scrape, `redis_exporter` stops emitting `redis_key_size{key="jobs"}` altogether. If your `AutoscalingMetric` query is just:
+
+```yaml
+query: 'max(redis_key_size{namespace="hpa-scale-to-zero", key="jobs"})'
 ```
 
-returns an **empty vector** (zero time series) instead of `0`.
+then as soon as the queue drains and the Prometheus lookback window passes, that query returns an empty vector with zero time series.
 
-When the Autoscaling Metrics Adapter (AMA) receives an empty vector from Managed Service for Prometheus, it returns an error for that metric lookup. HPA records `MetricGetExternal` failure (`<unknown>/20 (avg)`), sets `ScalingActive: False`, and **refuses to scale the Deployment down to zero** because it cannot confirm that Queue Depth is zero.
+`autoscaling-metrics-adapter` treats an empty PromQL result as a failed metric lookup. HPA records `MetricGetExternal` failure, displays `<unknown>/20 (avg)` in `kubectl get hpa`, flips `ScalingActive` to `False`, and refuses to scale down. Your workers stay stuck running forever against an empty queue because the metric disappeared at the exact moment you needed it to read `0`.
 
-Appending `or vector(0)` to the PromQL expression in `AutoscalingMetric` solves this cleanly ([ADR-0001](docs/adr/0001-redis-podmonitoring-over-pubsub-for-fast-scale-to-zero.md)):
+Appending `or vector(0)` in `AutoscalingMetric` fixes it:
 
-```promql
-max(redis_key_size{namespace="hpa-scale-to-zero", key="jobs"}) or vector(0)
+```yaml
+query: 'max(redis_key_size{namespace="hpa-scale-to-zero", key="jobs"}) or vector(0)'
 ```
 
-Whenever `redis_key_size{key="jobs"}` is present, `max(...)` returns the active Queue Depth. Whenever the `jobs` key disappears, the union falls back to `vector(0)`, giving AMA and HPA a valid `0` scalar series so the Deployment scales cleanly into the Zero-Scale State (`ScaledToZero: True`).
+Whenever `redis_key_size{key="jobs"}` exists, `max(...)` returns the queue depth. The instant Redis deletes the empty key, the union falls back to `vector(0)` so HPA gets a clean `0` sample and scales the Deployment down to zero. This same pattern applies to any Prometheus metric whose label set disappears when idle.
 
-### Lesson 2: Starting at `replicas: 0` triggers GKE's External Scale-to-Zero Override (`ADR-0002`)
+### 2. Starting a Deployment at `replicas: 0` disables HPA scaling
 
-If you author `Deployment/job-worker` with `replicas: 0` in your YAML manifest and apply it before AMA has finished warming up and publishing metric samples, or if an operator manually runs `kubectl scale deployment/job-worker --replicas=0`, GKE's HPA controller does not wake the Deployment up when jobs arrive. Instead, `kubectl describe hpa` shows:
+My first instinct for a scale-to-zero worker was to set `replicas: 0` in the `Deployment` YAML. When I applied the manifests before the metrics adapter finished warming up, HPA refused to scale the Deployment even after I pushed 100 jobs into Redis. `kubectl describe hpa` showed why:
 
-```text
+```bash
 Conditions:
   Type            Status  Reason                             Message
   ----            ------  ------                             -------
@@ -215,15 +267,15 @@ Conditions:
   ScalingActive   False   ScalingDisabledReplicaCountZero    scaling is disabled since the replica count of the target is zero
 ```
 
-(If you scale an active Deployment to `0` manually while HPA is watching it, GKE reports the companion reason `ScalingDisabledExternalScaleToZero`.)
+If you manually run `kubectl scale deployment/job-worker --replicas=0` on a running workload, GKE sets a related reason, `ScalingDisabledExternalScaleToZero`.
 
-Why does GKE do this? In production, if an incident responder runs `kubectl scale --replicas=0` to stop a runaway consumer during an outage, they do not want HPA to immediately fight them and scale the workload back up 15 seconds later. GKE's HPA controller tracks whether **HPA itself** actuated the transition to `0` replicas (which sets condition `ScaledToZero: True` and keeps `ScalingActive: True`) or whether an external actor set `spec.replicas = 0` (which triggers the External Scale-to-Zero Override and pauses HPA).
+Once you think about incident response, GKE's behavior makes sense. If an on-call engineer runs `kubectl scale --replicas=0` during an outage to stop a runaway consumer from hammering a downstream database, they do not want HPA to see the growing queue 15 seconds later and spin the pods right back up. GKE's HPA controller tracks who scaled the target to zero. If HPA itself scaled the workload down to zero, it sets `ScaledToZero: True` and keeps `ScalingActive: True`. If a human or a manifest set `spec.replicas = 0` outside HPA, the controller assumes an operator turned the service off on purpose and pauses autoscaling.
 
-Therefore, `Deployment/job-worker` is declared with `replicas: 1` ([ADR-0002](docs/adr/0002-initial-single-replica-for-hpa-actuated-scale-to-zero.md)). On initial `make apply`, a single worker pod starts while AMA wakes up in `kube-system`. As soon as AMA begins serving `0` from `or vector(0)`, HPA itself scales `job-worker` from `1` down to `0` replicas and sets `ScaledToZero=True (ScaledToZero)` alongside `ScalingActive=True (ValidMetricFound)`.
+Starting `Deployment/job-worker` at `replicas: 1` avoids this completely. When `make apply` runs, one worker pod boots while `autoscaling-metrics-adapter` wakes up in `kube-system`. Once the adapter serves `0` from `or vector(0)`, HPA itself actuates the `1 -> 0` transition, setting `ScaledToZero=True` while keeping `ScalingActive=True`.
 
-### Lesson 3: Default `scaleUp` policies cap wake-from-zero at 4 pods (`ADR-0003`)
+### 3. Default Kubernetes `scaleUp` policies cap wake-from-zero at 4 pods
 
-In Kubernetes `autoscaling/v2`, when you omit `spec.behavior.scaleUp.policies`, HPA applies two default scale-up rules and picks whichever allows the larger step every 15 seconds:
+When you omit `spec.behavior.scaleUp.policies` on an `autoscaling/v2` HPA, Kubernetes applies two default rules every 15 seconds and picks whichever allows the bigger jump:
 
 ```yaml
 policies:
@@ -236,9 +288,11 @@ policies:
 selectPolicy: Max
 ```
 
-When a Deployment is running at `4` replicas, `100%` allows it to double to `8`. When a Deployment is in the Zero-Scale State (`0` current replicas), **`100%` of `0` is `0`**. Only the `type: Pods` policy contributes on the wake-from-zero tick. With the default `value: 4`, pushing a 100-item Job Burst (`desired = 100 / 20 = 5` replicas) scales the Deployment from `0 -> 4` on the first tick and forces it to wait another 15 seconds before scaling from `4 -> 5`.
+When a Deployment has 4 pods running, `100%` lets it double to 8 pods in a single step. When a Deployment is scaled to zero, `100%` of `0` is `0`.
 
-Adding an explicit `Pods` policy in `spec.behavior.scaleUp.policies` with `value: 10` (matching `maxReplicas: 10`) allows HPA to jump directly from `0` to `5` (or up to `10`) replicas in a single reconciliation step ([ADR-0003](docs/adr/0003-explicit-pods-scaleup-policy-for-wake-from-zero.md)):
+That means on the wake-from-zero tick, every percentage policy evaluates to zero and only the `type: Pods` policy does anything. With the default `value: 4`, pushing 100 jobs with a target of 20 jobs per pod means HPA wants 5 pods, yet it only scales the Deployment from `0 -> 4` on the first tick and waits another 15 seconds to step from `4 -> 5`.
+
+Adding an explicit `Pods` policy matching `maxReplicas: 10` lets HPA jump straight from `0` to `5` pods in one step:
 
 ```yaml
   behavior:
@@ -250,15 +304,15 @@ Adding an explicit `Pods` policy in `spec.behavior.scaleUp.policies` with `value
           periodSeconds: 15
 ```
 
-## Live GKE 1.37 walkthrough: `1 -> 0 -> 5 -> 0` in 82 seconds
+## What the live `1 -> 0 -> 5 -> 0` loop looks like on GKE 1.37
 
-Let's walk through the exact output captured by `./hack/verify-e2e.sh` (`make verify`) on our GKE `v1.37.0-gke.3503000` cluster (`gke_mofilabs_us-central1-a_ate-cluster`).
+Here is the real output from running `make verify` against my `v1.37.0-gke.3503000` cluster, `gke_mofilabs_us-central1-a_ate-cluster`.
 
-### Stage 1: `make apply` and initial `1 -> 0` actuation into Zero-Scale State
+### Stage 1: Initial `1 -> 0` scale-down after `make apply`
 
-Applying the manifests deploys `redis-queue`, `redis-queue-monitoring`, `redis-queue-depth`, `job-worker` (`replicas: 1`), and `job-worker-hpa`. Once AMA reports `0` pending jobs, HPA actuates the initial `1 -> 0` scale-down:
+After `make apply`, `job-worker` starts at 1 replica while `autoscaling-metrics-adapter` rolls out in `kube-system`. Once the adapter starts serving `0` for `autoscaling.gke.io|redis-queue-depth|pending-jobs`, HPA scales `job-worker` from `1` down to `0`:
 
-```text
+```bash
 [2026-10-16T21:32:10Z] === Stage 1/5: Deploying stack via 'make apply' and verifying initial Zero-Scale State (1 -> 0) ===
 kubectl --context=gke_mofilabs_us-central1-a_ate-cluster apply -f manifests/01-redis-queue.yaml
 kubectl --context=gke_mofilabs_us-central1-a_ate-cluster apply -f manifests/02-worker-and-hpa.yaml
@@ -267,9 +321,9 @@ kubectl --context=gke_mofilabs_us-central1-a_ate-cluster apply -f manifests/02-w
 [2026-10-16T21:32:59Z]   [init-poll] spec.replicas=0 pods=0 | AbleToScale=True ScalingActive=True ScaledToZero=True
 ```
 
-Running `make status` (`./hack/watch.sh --once`) at `21:32:59Z` confirms the cluster is in the steady Zero-Scale State:
+At `21:32:59Z`, `make status` shows the workload sitting at zero pods with all three HPA conditions healthy:
 
-```text
+```bash
 ================================================================================
 GKE HPA Scale-to-Zero Observer | 2026-10-16T21:32:59Z | context: gke_mofilabs_us-central1-a_ate-cluster
 ================================================================================
@@ -281,22 +335,15 @@ HPA Conditions                 : AbleToScale=True | ScalingActive=True (ValidMet
 Job Worker (Deployment)        : job-worker = 0/0 Ready
 --------------------------------------------------------------------------------
 Job Worker Pods (namespace: hpa-scale-to-zero):
-  (0 pods running — Zero-Scale State)
+  (0 pods running - Zero-Scale State)
 ================================================================================
 ```
 
-Notice the three HPA conditions in this state:
-- `AbleToScale=True`
-- `ScalingActive=True (ValidMetricFound)`
-- `ScaledToZero=True (ScaledToZero)`
+### Stage 2: Waking from `0` to `5` pods in 11 seconds
 
-Zero Job Worker pods are running, and HPA is actively polling AMA for a non-zero metric sample.
+At `21:33:13Z`, `make burst JOBS=100` pushes 100 items into the Redis list:
 
-### Stage 2: Triggering a 100-item Job Burst (`0 -> 5` wake-from-zero in 11 seconds)
-
-At `21:33:13Z`, we push 100 synthetic items into the Redis Job Queue in a single `LPUSH` command via `make burst JOBS=100`:
-
-```text
+```bash
 [2026-10-16T21:33:13Z] === Stage 3/5: Triggering 100-job burst via 'make burst JOBS=100' and verifying 0 -> 5 scale-from-zero ===
 Pushing 100 synthetic jobs into Redis Job Queue (namespace: hpa-scale-to-zero)...
 Job Burst complete: pushed 100 items -> updated Queue Depth (LLEN jobs) = 100
@@ -307,13 +354,11 @@ Job Burst complete: pushed 100 items -> updated Queue Depth (LLEN jobs) = 100
 [2026-10-16T21:33:24Z]   --> Reached target scale of 5/5 Ready job-worker replicas at +11s!
 ```
 
-Look closely at the two timestamps:
-- At **`+5s`** (`21:33:18Z`), `PodMonitoring` has scraped `redis_exporter`, Managed Service for Prometheus has ingested `redis_key_size = 100`, AMA has served the updated value, and HPA has already computed `desired=5` (`100 / 20 = 5`) and flipped `ScaledToZero=False`.
-- At **`+11s`** (`21:33:24Z`), all `5/5` Job Worker pods are `Running` and `Ready` and have already popped the first 10 jobs (`LLEN=90`).
+Five seconds after the burst, at `21:33:18Z`, `PodMonitoring` has scraped `redis_exporter`, Managed Service for Prometheus has ingested `redis_key_size = 100`, the adapter has served the new value, and HPA has set `desired=5` and `ScaledToZero=False`.
 
-Here is the `make status` snapshot captured at `5/5` Ready replicas:
+Six seconds after that, 11 seconds into the run at `21:33:24Z`, all five `job-worker` pods are `Running` and `Ready` and have already popped the first 10 jobs from Redis. Here is the `make status` snapshot with all 5 pods active:
 
-```text
+```bash
 ================================================================================
 GKE HPA Scale-to-Zero Observer | 2026-10-16T21:33:38Z | context: gke_mofilabs_us-central1-a_ate-cluster
 ================================================================================
@@ -335,9 +380,9 @@ Latest Worker Log              : [pod/job-worker-755bf6d97d-fmf7p/worker] [2026-
 ================================================================================
 ```
 
-And a slice of `make logs` showing all 5 pods draining the Redis list every 2 seconds in parallel:
+And `make logs` shows all five pods pulling items off the Redis list in parallel:
 
-```text
+```bash
 [pod/job-worker-755bf6d97d-6zvgf/worker] [2026-10-16T21:33:18Z] [job-worker-755bf6d97d-6zvgf] Job Worker started; polling redis-queue...
 [pod/job-worker-755bf6d97d-6zvgf/worker] [2026-10-16T21:33:18Z] [job-worker-755bf6d97d-6zvgf] Processed job: job-004@2026-10-16T21:33:14Z
 [pod/job-worker-755bf6d97d-8dvdz/worker] [2026-10-16T21:33:18Z] [job-worker-755bf6d97d-8dvdz] Processed job: job-005@2026-10-16T21:33:14Z
@@ -346,11 +391,11 @@ And a slice of `make logs` showing all 5 pods draining the Redis list every 2 se
 [pod/job-worker-755bf6d97d-fmf7p/worker] [2026-10-16T21:33:18Z] [job-worker-755bf6d97d-fmf7p] Processed job: job-001@2026-10-16T21:33:14Z
 ```
 
-### Stage 3: Queue drain and return to Zero-Scale State (`5 -> 0`)
+### Stage 3: Draining the queue and scaling back to `0`
 
-As the 5 workers consume 2.5 jobs per second combined, Queue Depth steps down smoothly (`80 -> 40 -> 27 -> 19 -> 7 -> 2 -> 0`) and reaches `0` at **`+55s`** after the burst (`21:34:08Z`):
+With five pods each popping one job every 2 seconds, the queue steps down from 80 to 40, 27, 19, 7, 2, and finally 0 at 55 seconds after the burst, at `21:34:08Z`:
 
-```text
+```bash
 [2026-10-16T21:33:42Z]   [drain poll +29s] LLEN=40 | deploy spec=4 ready=4
 [2026-10-16T21:33:47Z]   [drain poll +34s] LLEN=27 | deploy spec=4 ready=4
 [2026-10-16T21:33:53Z]   [drain poll +40s] LLEN=19 | deploy spec=4 ready=2
@@ -360,9 +405,9 @@ As the 5 workers consume 2.5 jobs per second combined, Queue Depth steps down sm
 [2026-10-16T21:34:08Z]   --> Job Queue drained to 0 at +55s since burst (28s drain duration)
 ```
 
-Once `LLEN jobs` hits `0`, Redis deletes the `jobs` key, `or vector(0)` in `AutoscalingMetric` emits `0`, and HPA waits for the 15-second Scale-Down Stabilization Window (`spec.behavior.scaleDown.stabilizationWindowSeconds: 15`) before scaling the final replica down to `0`:
+Notice that HPA already trimmed the Deployment from 5 pods down to 4, then 2, and then 1 as the backlog shrank. Once `LLEN jobs` reaches `0`, Redis deletes the `jobs` key, `or vector(0)` keeps feeding `0` to HPA, and HPA waits for the 15-second `scaleDown.stabilizationWindowSeconds` window before terminating the last pod:
 
-```text
+```bash
 [2026-10-16T21:34:13Z]   [scale-down poll +5s after drain / +60s total] LLEN=0 | spec.replicas=1 pods=2 | AbleToScale=True ScalingActive=True ScaledToZero=False
 [2026-10-16T21:34:20Z]   [scale-down poll +12s after drain / +67s total] LLEN=0 | spec.replicas=1 pods=1 | AbleToScale=True ScalingActive=True ScaledToZero=False
 [2026-10-16T21:34:28Z]   [scale-down poll +20s after drain / +75s total] LLEN=0 | spec.replicas=0 pods=1 | AbleToScale=True ScalingActive=True ScaledToZero=True
@@ -370,9 +415,9 @@ Once `LLEN jobs` hits `0`, Redis deletes the `jobs` key, `or vector(0)` in `Auto
 [2026-10-16T21:34:35Z]   --> Returned to Zero-Scale State (5 -> 0) at +27s after queue drain (+82s total since burst)!
 ```
 
-At **`+20s` after queue drain** (`+75s` total since burst), HPA sets `spec.replicas=0` and flips `ScaledToZero=True`. Seven seconds later (`+27s` after drain, `+82s` total since burst), the last terminating pod exits and `make status` shows the workload back in the Zero-Scale State:
+Twenty seconds after the queue hits zero, 75 seconds after the burst, HPA sets `spec.replicas=0` and flips `ScaledToZero=True`. Seven seconds later, at 82 seconds total, the last pod finishes terminating:
 
-```text
+```bash
 ================================================================================
 GKE HPA Scale-to-Zero Observer | 2026-10-16T21:34:35Z | context: gke_mofilabs_us-central1-a_ate-cluster
 ================================================================================
@@ -384,39 +429,20 @@ HPA Conditions                 : AbleToScale=True | ScalingActive=True (ValidMet
 Job Worker (Deployment)        : job-worker = 0/0 Ready
 --------------------------------------------------------------------------------
 Job Worker Pods (namespace: hpa-scale-to-zero):
-  (0 pods running — Zero-Scale State)
+  (0 pods running - Zero-Scale State)
 ================================================================================
 ```
 
-### Observed lifecycle timing summary (`ate-cluster`, `v1.37.0-gke.3503000`)
+### Timing breakdown on GKE `v1.37.0-gke.3503000`
 
-| Lifecycle milestone | Timestamp (UTC) | Elapsed from burst | HPA `desired` | `ScaledToZero` | `job-worker` Ready |
+| Event | Timestamp (UTC) | Elapsed from burst | HPA `desired` | `ScaledToZero` | `job-worker` Ready |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| Initial Zero-Scale State settled (`1 -> 0`) | `21:32:59Z` | `-14s` | `0` | `True` | `0/0` |
+| Initial scale-to-zero complete (`1 -> 0`) | `21:32:59Z` | `-14s` | `0` | `True` | `0/0` |
 | `make burst JOBS=100` (`LLEN jobs = 100`) | `21:33:13Z` | `0s` | `0` | `True` | `0/0` |
-| HPA computes wake-up target (`0 -> 5`) | `21:33:18Z` | `+5s` | `5` | `False` | `0/0` |
-| All 5 Job Worker pods `Running` & `Ready` | `21:33:24Z` | `+11s` | `5` | `False` | `5/5` |
-| Job Queue drained (`LLEN jobs = 0`) | `21:34:08Z` | `+55s` | `1` | `False` | `1/1` |
-| HPA actuates scale-to-zero after 15s window | `21:34:28Z` | `+75s` (`+20s` post-drain) | `0` | `True` | `0/1` (terminating) |
-| Final pod terminated (back in Zero-Scale State) | `21:34:35Z` | `+82s` (`+27s` post-drain) | `0` | `True` | `0/0` |
+| HPA updates target scale (`0 -> 5`) | `21:33:18Z` | `+5s` | `5` | `False` | `0/0` |
+| All 5 `job-worker` pods `Running` & `Ready` | `21:33:24Z` | `+11s` | `5` | `False` | `5/5` |
+| Queue drained (`LLEN jobs = 0`) | `21:34:08Z` | `+55s` | `1` | `False` | `1/1` |
+| HPA scales to zero after 15s window | `21:34:28Z` | `+75s` | `0` | `True` | `0/1` |
+| Final pod terminated (`0/0` Ready) | `21:34:35Z` | `+82s` | `0` | `True` | `0/0` |
 
-## Running the demo on your own GKE 1.37+ cluster
-
-Clone the repository and run the three `make` targets against any GKE 1.37+ cluster with Managed Service for Prometheus enabled:
-
-```bash
-# 1. Deploy the Redis Job Queue, PodMonitoring, AutoscalingMetric, Job Worker, and HPA
-make apply
-
-# 2. Watch the single-pane observer (or run `make status` for a one-shot snapshot)
-make watch
-
-# 3. In another terminal, push 100 jobs and watch 0 -> 5 -> 0 scaling
-make burst JOBS=100
-
-# 4. Or run the automated end-to-end assertion harness
-make verify
-
-# 5. Clean up all resources when finished
-make clean
-```
+All the manifests, the observer script, and the end-to-end verification script live in [github.com/moficodes/gke-hpa-scale-to-zero](https://github.com/moficodes/gke-hpa-scale-to-zero).
