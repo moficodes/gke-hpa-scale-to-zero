@@ -20,41 +20,71 @@ KUBECTL=(kubectl --context="${KUBE_CONTEXT}")
 readonly K8S_ZERO_PODS_AVG_SENTINEL="-9223372036854775808"
 
 render_snapshot() {
-  local queue_depth
-  queue_depth="$("${KUBECTL[@]}" exec -n "${NAMESPACE}" deploy/redis-queue -c redis -- redis-cli llen jobs 2>/dev/null | tr -d '\r[:space:]' || echo "N/A")"
-  if [[ -z "${queue_depth}" ]]; then
-    queue_depth="N/A"
-  fi
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
 
-  local ama_ready ama_desired
-  ama_ready="$("${KUBECTL[@]}" get deployment autoscaling-metrics-adapter -n kube-system -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
-  ama_desired="$("${KUBECTL[@]}" get deployment autoscaling-metrics-adapter -n kube-system -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+  # Run independent cluster queries in parallel for fast (~1s) single-pane refresh
+  (
+    "${KUBECTL[@]}" exec -n "${NAMESPACE}" deploy/redis-queue -c redis -- redis-cli llen jobs 2>/dev/null \
+      | tr -d '\r[:space:]' > "${tmp_dir}/queue_depth" || true
+  ) &
+  (
+    "${KUBECTL[@]}" get deployment autoscaling-metrics-adapter -n kube-system \
+      -o jsonpath='{.status.readyReplicas}~{.spec.replicas}' 2>/dev/null > "${tmp_dir}/ama" || true
+  ) &
+  (
+    "${KUBECTL[@]}" get autoscalingmetric redis-queue-depth -n "${NAMESPACE}" \
+      -o jsonpath='{.status.metricStatuses[0].hpaName}~{.status.metricStatuses[0].errors}' 2>/dev/null > "${tmp_dir}/asm" || true
+  ) &
+  (
+    "${KUBECTL[@]}" get deployment job-worker -n "${NAMESPACE}" \
+      -o jsonpath='{.status.readyReplicas}~{.spec.replicas}' 2>/dev/null > "${tmp_dir}/worker" || true
+  ) &
+  (
+    "${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" \
+      -o jsonpath='{.status.desiredReplicas}~{.spec.minReplicas}~{.spec.maxReplicas}~{.spec.metrics[0].external.target.averageValue}~{.status.currentMetrics[0].external.current.value}~{.status.currentMetrics[0].external.current.averageValue}~{.status.conditions[?(@.type=="AbleToScale")].status}~{.status.conditions[?(@.type=="ScalingActive")].status}~{.status.conditions[?(@.type=="ScalingActive")].reason}~{.status.conditions[?(@.type=="ScaledToZero")].status}~{.status.conditions[?(@.type=="ScaledToZero")].reason}' \
+      2>/dev/null > "${tmp_dir}/hpa" || true
+  ) &
+  (
+    local p_out
+    p_out="$("${KUBECTL[@]}" get pods -n "${NAMESPACE}" -l app=job-worker 2>/dev/null || true)"
+    printf '%s' "${p_out}" > "${tmp_dir}/pods"
+    if [[ -n "${p_out}" ]]; then
+      "${KUBECTL[@]}" logs -n "${NAMESPACE}" -l app=job-worker --tail=1 --prefix=true 2>/dev/null \
+        | tail -n 1 > "${tmp_dir}/latest_log" || true
+    fi
+  ) &
+  wait
+
+  local queue_depth
+  queue_depth="$(<"${tmp_dir}/queue_depth")"
+  queue_depth="${queue_depth:-N/A}"
+
+  local ama_raw ama_ready ama_desired _rest
+  ama_raw="$(<"${tmp_dir}/ama")"
+  IFS='~' read -r ama_ready ama_desired _rest <<< "${ama_raw}~~"
   ama_ready="${ama_ready:-0}"
   ama_desired="${ama_desired:-0}"
 
-  local asm_hpa_name asm_errors
-  asm_hpa_name="$("${KUBECTL[@]}" get autoscalingmetric redis-queue-depth -n "${NAMESPACE}" \
-    -o jsonpath='{.status.metricStatuses[0].hpaName}' 2>/dev/null || true)"
-  asm_errors="$("${KUBECTL[@]}" get autoscalingmetric redis-queue-depth -n "${NAMESPACE}" \
-    -o jsonpath='{.status.metricStatuses[0].errors}' 2>/dev/null || true)"
+  local asm_raw asm_hpa_name asm_errors
+  asm_raw="$(<"${tmp_dir}/asm")"
+  IFS='~' read -r asm_hpa_name asm_errors _rest <<< "${asm_raw}~~"
   asm_hpa_name="${asm_hpa_name:-<pending>}"
   if [[ -z "${asm_errors}" || "${asm_errors}" == "[]" ]]; then
     asm_errors="none"
   fi
 
-  local worker_ready worker_spec
-  worker_ready="$("${KUBECTL[@]}" get deployment job-worker -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
-  worker_spec="$("${KUBECTL[@]}" get deployment job-worker -n "${NAMESPACE}" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+  local worker_raw worker_ready worker_spec
+  worker_raw="$(<"${tmp_dir}/worker")"
+  IFS='~' read -r worker_ready worker_spec _rest <<< "${worker_raw}~~"
   worker_ready="${worker_ready:-0}"
   worker_spec="${worker_spec:-0}"
 
-  local hpa_desired hpa_min hpa_max hpa_target_avg hpa_curr_val hpa_curr_avg
-  hpa_desired="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" -o jsonpath='{.status.desiredReplicas}' 2>/dev/null || true)"
-  hpa_min="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" -o jsonpath='{.spec.minReplicas}' 2>/dev/null || true)"
-  hpa_max="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" -o jsonpath='{.spec.maxReplicas}' 2>/dev/null || true)"
-  hpa_target_avg="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" -o jsonpath='{.spec.metrics[0].external.target.averageValue}' 2>/dev/null || true)"
-  hpa_curr_val="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" -o jsonpath='{.status.currentMetrics[0].external.current.value}' 2>/dev/null || true)"
-  hpa_curr_avg="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" -o jsonpath='{.status.currentMetrics[0].external.current.averageValue}' 2>/dev/null || true)"
+  local hpa_raw hpa_desired hpa_min hpa_max hpa_target_avg hpa_curr_val hpa_curr_avg
+  local able_to_scale scaling_active scaling_reason scaled_to_zero zero_reason
+  hpa_raw="$(<"${tmp_dir}/hpa")"
+  IFS='~' read -r hpa_desired hpa_min hpa_max hpa_target_avg hpa_curr_val hpa_curr_avg \
+    able_to_scale scaling_active scaling_reason scaled_to_zero zero_reason _rest <<< "${hpa_raw}~~~~~~~~~~~"
 
   local metric_display
   if [[ "${hpa_curr_avg}" == "${K8S_ZERO_PODS_AVG_SENTINEL}" || -z "${hpa_curr_avg}" ]]; then
@@ -63,23 +93,10 @@ render_snapshot() {
     metric_display="avg=${hpa_curr_avg} (value=${hpa_curr_val:-?}) / target=${hpa_target_avg:-20} (avg)"
   fi
 
-  local able_to_scale scaling_active scaled_to_zero scaling_reason zero_reason
-  able_to_scale="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" \
-    -o jsonpath='{.status.conditions[?(@.type=="AbleToScale")].status}' 2>/dev/null || true)"
-  scaling_active="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" \
-    -o jsonpath='{.status.conditions[?(@.type=="ScalingActive")].status}' 2>/dev/null || true)"
-  scaling_reason="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" \
-    -o jsonpath='{.status.conditions[?(@.type=="ScalingActive")].reason}' 2>/dev/null || true)"
-  scaled_to_zero="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" \
-    -o jsonpath='{.status.conditions[?(@.type=="ScaledToZero")].status}' 2>/dev/null || true)"
-  zero_reason="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" \
-    -o jsonpath='{.status.conditions[?(@.type=="ScaledToZero")].reason}' 2>/dev/null || true)"
-
-  local pods_out latest_log=""
-  pods_out="$("${KUBECTL[@]}" get pods -n "${NAMESPACE}" -l app=job-worker 2>/dev/null || true)"
-  if [[ -n "${pods_out}" ]]; then
-    latest_log="$("${KUBECTL[@]}" logs -n "${NAMESPACE}" -l app=job-worker --tail=1 --prefix=true 2>/dev/null | tail -n 1 || true)"
-  fi
+  local pods_out="" latest_log=""
+  [[ -f "${tmp_dir}/pods" ]] && pods_out="$(<"${tmp_dir}/pods")"
+  [[ -f "${tmp_dir}/latest_log" ]] && latest_log="$(<"${tmp_dir}/latest_log")"
+  rm -rf "${tmp_dir}"
 
   local now_utc
   now_utc="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
@@ -115,7 +132,7 @@ if (( ONCE == 1 )); then
 fi
 
 while true; do
-   snap="$(render_snapshot)"
+  snap="$(render_snapshot)"
   clear 2>/dev/null || true
   printf '%s\n' "${snap}"
   printf 'Refreshing every %ss... (Press Ctrl+C to exit)\n' "${INTERVAL}"

@@ -31,7 +31,7 @@ logs: ## Show recent processed job log lines from running Job Worker pods
 	if [ "$${POD_COUNT}" = "0" ]; then \
 		echo "No Job Worker pods currently running in $(NAMESPACE) (Zero-Scale State)."; \
 	else \
-		$(KUBECTL) logs -n $(NAMESPACE) -l app=job-worker --tail=20 --prefix=true; \
+		$(KUBECTL) logs -n $(NAMESPACE) -l app=job-worker --tail=1 --prefix=true; \
 	fi
 
 verify: ## Run the automated end-to-end 1 -> 0 -> 5 -> 0 verification harness
