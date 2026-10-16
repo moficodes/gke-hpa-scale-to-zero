@@ -107,9 +107,9 @@ metadata:
 spec:
   metrics:
     - promql:
-      name: pending-jobs
-      type: External
-      query: 'max(redis_key_size{namespace="hpa-scale-to-zero", key="jobs"}) or vector(0)'
+        name: pending-jobs
+        type: External
+        query: 'max(redis_key_size{namespace="hpa-scale-to-zero", key="jobs"}) or vector(0)'
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -315,7 +315,7 @@ Here is the `make status` snapshot captured at `5/5` Ready replicas:
 
 ```text
 ================================================================================
-GKE HPA Scale-to-Zero Observer | 2026-10-16T21:33:24Z | context: gke_mofilabs_us-central1-a_ate-cluster
+GKE HPA Scale-to-Zero Observer | 2026-10-16T21:33:38Z | context: gke_mofilabs_us-central1-a_ate-cluster
 ================================================================================
 Job Queue (redis-queue)        : Queue Depth (LLEN jobs) = 80
 AMA (kube-system)              : autoscaling-metrics-adapter = 1/1 Ready

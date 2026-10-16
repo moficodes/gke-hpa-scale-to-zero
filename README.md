@@ -78,7 +78,7 @@ Within 5 seconds of the burst, HPA observes the external metric `autoscaling.gke
 
 ```text
 ================================================================================
-GKE HPA Scale-to-Zero Observer | 2026-10-16T21:33:24Z | context: gke_mofilabs_us-central1-a_ate-cluster
+GKE HPA Scale-to-Zero Observer | 2026-10-16T21:33:38Z | context: gke_mofilabs_us-central1-a_ate-cluster
 ================================================================================
 Job Queue (redis-queue)        : Queue Depth (LLEN jobs) = 80
 AMA (kube-system)              : autoscaling-metrics-adapter = 1/1 Ready

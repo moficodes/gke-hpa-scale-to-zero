@@ -16,11 +16,10 @@ if [[ "${1:-}" == "--once" ]]; then
 fi
 
 KUBECTL=(kubectl --context="${KUBE_CONTEXT}")
+# When 0 pods are running, Kubernetes HPA reports INT64_MIN for external.current.averageValue.
+readonly K8S_ZERO_PODS_AVG_SENTINEL="-9223372036854775808"
 
 render_snapshot() {
-  local now_utc
-  now_utc="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-
   local queue_depth
   queue_depth="$("${KUBECTL[@]}" exec -n "${NAMESPACE}" deploy/redis-queue -c redis -- redis-cli llen jobs 2>/dev/null | tr -d '\r[:space:]' || echo "N/A")"
   if [[ -z "${queue_depth}" ]]; then
@@ -58,7 +57,7 @@ render_snapshot() {
   hpa_curr_avg="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" -o jsonpath='{.status.currentMetrics[0].external.current.averageValue}' 2>/dev/null || true)"
 
   local metric_display
-  if [[ "${hpa_curr_avg}" == "-9223372036854775808" || -z "${hpa_curr_avg}" ]]; then
+  if [[ "${hpa_curr_avg}" == "${K8S_ZERO_PODS_AVG_SENTINEL}" || -z "${hpa_curr_avg}" ]]; then
     metric_display="value=${hpa_curr_val:-0} (0 pods) / target=${hpa_target_avg:-20} (avg)"
   else
     metric_display="avg=${hpa_curr_avg} (value=${hpa_curr_val:-?}) / target=${hpa_target_avg:-20} (avg)"
@@ -76,6 +75,15 @@ render_snapshot() {
   zero_reason="$("${KUBECTL[@]}" get hpa job-worker-hpa -n "${NAMESPACE}" \
     -o jsonpath='{.status.conditions[?(@.type=="ScaledToZero")].reason}' 2>/dev/null || true)"
 
+  local pods_out latest_log=""
+  pods_out="$("${KUBECTL[@]}" get pods -n "${NAMESPACE}" -l app=job-worker 2>/dev/null || true)"
+  if [[ -n "${pods_out}" ]]; then
+    latest_log="$("${KUBECTL[@]}" logs -n "${NAMESPACE}" -l app=job-worker --tail=1 --prefix=true 2>/dev/null | tail -n 1 || true)"
+  fi
+
+  local now_utc
+  now_utc="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
   printf '================================================================================\n'
   printf 'GKE HPA Scale-to-Zero Observer | %s | context: %s\n' "${now_utc}" "${KUBE_CONTEXT}"
   printf '================================================================================\n'
@@ -90,15 +98,10 @@ render_snapshot() {
   printf 'Job Worker (Deployment)        : job-worker = %s/%s Ready\n' "${worker_ready}" "${worker_spec}"
   printf -- '--------------------------------------------------------------------------------\n'
   printf 'Job Worker Pods (namespace: %s):\n' "${NAMESPACE}"
-
-  local pods_out
-  pods_out="$("${KUBECTL[@]}" get pods -n "${NAMESPACE}" -l app=job-worker 2>/dev/null || true)"
   if [[ -z "${pods_out}" ]]; then
     printf '  (0 pods running — Zero-Scale State)\n'
   else
     printf '%s\n' "${pods_out}" | sed 's/^/  /'
-    local latest_log
-    latest_log="$("${KUBECTL[@]}" logs -n "${NAMESPACE}" -l app=job-worker --tail=1 --prefix=true 2>/dev/null | tail -n 1 || true)"
     if [[ -n "${latest_log}" ]]; then
       printf 'Latest Worker Log              : %s\n' "${latest_log}"
     fi

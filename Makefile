@@ -7,10 +7,7 @@ INTERVAL ?= 2
 
 KUBECTL := kubectl --context=$(KUBE_CONTEXT)
 
-.PHONY: help apply burst watch status logs verify clean
-
-help: ## Show available make targets
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
+.PHONY: apply burst watch status logs verify clean
 
 apply: ## Deploy the Redis Job Queue, PodMonitoring, AutoscalingMetric, Job Worker, and HPA
 	$(KUBECTL) apply -f manifests/01-redis-queue.yaml
