@@ -1,0 +1,90 @@
+apiVersion: autoscaling.gke.io/v1beta1
+kind: AutoscalingMetric
+metadata:
+  name: redis-queue-depth
+  namespace: hpa-scale-to-zero
+  labels:
+    app.kubernetes.io/part-of: gke-hpa-scale-to-zero-demo
+spec:
+  metrics:
+    - promql:
+        name: pending-jobs
+        type: External
+        # ADR-0001: When the `jobs` list empties (LLEN jobs == 0), Redis deletes the key and
+        # redis_exporter stops emitting `redis_key_size{key="jobs"}`. The `or vector(0)` fallback
+        # guarantees a scalar 0 series so autoscaling-metrics-adapter and HPA can scale down to 0.
+        query: 'max(redis_key_size{namespace="hpa-scale-to-zero", key="jobs"}) or vector(0)'
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: job-worker
+  namespace: hpa-scale-to-zero
+  labels:
+    app: job-worker
+    app.kubernetes.io/part-of: gke-hpa-scale-to-zero-demo
+spec:
+  # ADR-0002: Start at replicas: 1 so HPA itself actuates the initial 1 -> 0 transition into the
+  # Zero-Scale State (ScaledToZero: True, ScalingActive: True) rather than triggering GKE's
+  # External Scale-to-Zero Override safeguard (ScalingDisabledReplicaCountZero).
+  replicas: 1
+  selector:
+    matchLabels:
+      app: job-worker
+  template:
+    metadata:
+      labels:
+        app: job-worker
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: worker
+          image: redis:7-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] [$(hostname)] Job Worker started; polling redis-queue..."
+              while true; do
+                JOB="$(redis-cli -h redis-queue rpop jobs 2>/dev/null || true)"
+                if [ -n "${JOB}" ]; then
+                  echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] [$(hostname)] Processed job: ${JOB}"
+                fi
+                sleep 2
+              done
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: job-worker-hpa
+  namespace: hpa-scale-to-zero
+  labels:
+    app: job-worker
+    app.kubernetes.io/part-of: gke-hpa-scale-to-zero-demo
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: job-worker
+  minReplicas: 0
+  maxReplicas: 10
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+    scaleDown:
+      # Scale-Down Stabilization Window: 15s of continuous zero Queue Depth before returning to 0.
+      stabilizationWindowSeconds: 15
+  metrics:
+    - type: External
+      external:
+        metric:
+          name: autoscaling.gke.io|redis-queue-depth|pending-jobs
+        target:
+          type: AverageValue
+          averageValue: "20"
