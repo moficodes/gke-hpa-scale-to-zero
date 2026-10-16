@@ -77,6 +77,13 @@ spec:
   behavior:
     scaleUp:
       stabilizationWindowSeconds: 0
+      # When scaling from 0 replicas, Percent-based policies evaluate 100% of 0 = 0 and Kubernetes's
+      # default Pods policy caps wake-from-zero at 4 pods per 15s. Setting value: 10 allows a single
+      # scale-from-zero step up to maxReplicas (e.g., 0 -> 5 on a 100-item Job Burst).
+      policies:
+        - type: Pods
+          value: 10
+          periodSeconds: 15
     scaleDown:
       # Scale-Down Stabilization Window: 15s of continuous zero Queue Depth before returning to 0.
       stabilizationWindowSeconds: 15
