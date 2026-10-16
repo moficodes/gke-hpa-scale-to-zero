@@ -15,6 +15,31 @@ if [[ "${1:-}" == "--once" ]]; then
   ONCE=1
 fi
 
+# Enable Gruvbox-tuned 256-color ANSI highlights when attached to a terminal or when FORCE_COLOR=1 is set
+if [[ -z "${NO_COLOR:-}" && ( -t 1 || "${FORCE_COLOR:-0}" == "1" ) ]]; then
+  C_RESET=$'\033[0m'
+  C_DIM=$'\033[38;5;245m'
+  C_BOLD_GREEN=$'\033[1;38;5;142m'
+  C_GREEN=$'\033[38;5;142m'
+  C_BOLD_YELLOW=$'\033[1;38;5;214m'
+  C_YELLOW=$'\033[38;5;214m'
+  C_BOLD_BLUE=$'\033[1;38;5;109m'
+  C_BOLD_MAGENTA=$'\033[1;38;5;175m'
+  C_BOLD_CYAN=$'\033[1;38;5;108m'
+  C_CYAN=$'\033[38;5;108m'
+else
+  C_RESET=""
+  C_DIM=""
+  C_BOLD_GREEN=""
+  C_GREEN=""
+  C_BOLD_YELLOW=""
+  C_YELLOW=""
+  C_BOLD_BLUE=""
+  C_BOLD_MAGENTA=""
+  C_BOLD_CYAN=""
+  C_CYAN=""
+fi
+
 KUBECTL=(kubectl --context="${KUBE_CONTEXT}")
 # When 0 pods are running, Kubernetes HPA reports INT64_MIN for external.current.averageValue.
 readonly K8S_ZERO_PODS_AVG_SENTINEL="-9223372036854775808"
@@ -101,29 +126,54 @@ render_snapshot() {
   local now_utc
   now_utc="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
-  printf '================================================================================\n'
-  printf 'GKE HPA Scale-to-Zero Observer | %s | context: %s\n' "${now_utc}" "${KUBE_CONTEXT}"
-  printf '================================================================================\n'
-  printf 'Job Queue (redis-queue)        : Queue Depth (LLEN jobs) = %s\n' "${queue_depth}"
-  printf 'AMA (kube-system)              : autoscaling-metrics-adapter = %s/%s Ready\n' "${ama_ready}" "${ama_desired}"
-  printf 'AutoscalingMetric              : redis-queue-depth -> hpaName=%s (errors=%s)\n' "${asm_hpa_name}" "${asm_errors}"
-  printf 'HPA (job-worker-hpa)           : desired=%s (min=%s, max=%s) | metric: %s\n' \
-    "${hpa_desired:-0}" "${hpa_min:-0}" "${hpa_max:-10}" "${metric_display}"
-  printf 'HPA Conditions                 : AbleToScale=%s | ScalingActive=%s (%s) | ScaledToZero=%s (%s)\n' \
-    "${able_to_scale:-Unknown}" "${scaling_active:-Unknown}" "${scaling_reason:-N/A}" \
-    "${scaled_to_zero:-Unknown}" "${zero_reason:-N/A}"
-  printf 'Job Worker (Deployment)        : job-worker = %s/%s Ready\n' "${worker_ready}" "${worker_spec}"
-  printf -- '--------------------------------------------------------------------------------\n'
-  printf 'Job Worker Pods (namespace: %s):\n' "${NAMESPACE}"
+  local q_color="${C_BOLD_GREEN}"
+  if [[ "${queue_depth}" != "0" && "${queue_depth}" != "N/A" ]]; then
+    q_color="${C_BOLD_YELLOW}"
+  fi
+
+  local s2z_color="${C_BOLD_CYAN}"
+  if [[ "${scaled_to_zero:-Unknown}" == "False" ]]; then
+    s2z_color="${C_BOLD_YELLOW}"
+  fi
+
+  local worker_color="${C_BOLD_CYAN}"
+  if [[ "${worker_ready}" != "0" ]]; then
+    worker_color="${C_BOLD_GREEN}"
+  fi
+
+  printf '%s================================================================================%s\n' "${C_DIM}" "${C_RESET}"
+  printf '%sGKE HPA Scale-to-Zero Observer%s | %s%s%s | context: %s%s%s\n' \
+    "${C_BOLD_YELLOW}" "${C_RESET}" "${C_CYAN}" "${now_utc}" "${C_RESET}" "${C_BOLD_BLUE}" "${KUBE_CONTEXT}" "${C_RESET}"
+  printf '%s================================================================================%s\n' "${C_DIM}" "${C_RESET}"
+  printf '%sJob Queue (redis-queue)%s        : Queue Depth (LLEN jobs) = %s%s%s\n' \
+    "${C_BOLD_CYAN}" "${C_RESET}" "${q_color}" "${queue_depth}" "${C_RESET}"
+  printf '%sAMA (kube-system)%s              : autoscaling-metrics-adapter = %s%s/%s Ready%s\n' \
+    "${C_BOLD_CYAN}" "${C_RESET}" "${C_BOLD_GREEN}" "${ama_ready}" "${ama_desired}" "${C_RESET}"
+  printf '%sAutoscalingMetric%s              : %sredis-queue-depth%s -> hpaName=%s%s%s (%serrors=%s%s)\n' \
+    "${C_BOLD_CYAN}" "${C_RESET}" "${C_BOLD_BLUE}" "${C_RESET}" "${C_YELLOW}" "${asm_hpa_name}" "${C_RESET}" "${C_GREEN}" "${asm_errors}" "${C_RESET}"
+  printf '%sHPA (job-worker-hpa)%s           : desired=%s%s%s (min=%s, max=%s) | metric: %s%s%s\n' \
+    "${C_BOLD_CYAN}" "${C_RESET}" "${C_BOLD_YELLOW}" "${hpa_desired:-0}" "${C_RESET}" "${hpa_min:-0}" "${hpa_max:-10}" "${C_CYAN}" "${metric_display}" "${C_RESET}"
+  printf '%sHPA Conditions%s                 : %sAbleToScale=%s%s | %sScalingActive=%s%s (%s) | %sScaledToZero=%s%s (%s)\n' \
+    "${C_BOLD_CYAN}" "${C_RESET}" \
+    "${C_BOLD_GREEN}" "${able_to_scale:-Unknown}" "${C_RESET}" \
+    "${C_BOLD_GREEN}" "${scaling_active:-Unknown}" "${C_RESET}" "${scaling_reason:-N/A}" \
+    "${s2z_color}" "${scaled_to_zero:-Unknown}" "${C_RESET}" "${zero_reason:-N/A}"
+  printf '%sJob Worker (Deployment)%s        : job-worker = %s%s/%s Ready%s\n' \
+    "${C_BOLD_CYAN}" "${C_RESET}" "${worker_color}" "${worker_ready}" "${worker_spec}" "${C_RESET}"
+  printf '%s--------------------------------------------------------------------------------%s\n' "${C_DIM}" "${C_RESET}"
+  printf '%sJob Worker Pods (namespace: %s):%s\n' "${C_BOLD_CYAN}" "${NAMESPACE}" "${C_RESET}"
   if [[ -z "${pods_out}" ]]; then
-    printf '  (0 pods running - Zero-Scale State)\n'
+    printf '  %s(0 pods running - Zero-Scale State)%s\n' "${C_CYAN}" "${C_RESET}"
   else
-    printf '%s\n' "${pods_out}" | sed 's/^/  /'
+    printf '%s\n' "${pods_out}" | awk -v hdr="${C_BOLD_YELLOW}" -v grn="${C_BOLD_GREEN}" -v rst="${C_RESET}" '
+      NR==1 { print "  " hdr $0 rst; next }
+      { gsub(/Running/, grn "Running" rst); print "  " $0 }
+    '
     if [[ -n "${latest_log}" ]]; then
-      printf 'Latest Worker Log              : %s\n' "${latest_log}"
+      printf '%sLatest Worker Log%s              : %s\n' "${C_BOLD_MAGENTA}" "${C_RESET}" "${latest_log}"
     fi
   fi
-  printf '================================================================================\n'
+  printf '%s================================================================================%s\n' "${C_DIM}" "${C_RESET}"
 }
 
 if (( ONCE == 1 )); then
@@ -135,6 +185,6 @@ while true; do
   snap="$(render_snapshot)"
   clear 2>/dev/null || true
   printf '%s\n' "${snap}"
-  printf 'Refreshing every %ss... (Press Ctrl+C to exit)\n' "${INTERVAL}"
+  printf '%sRefreshing every %ss... (Press Ctrl+C to exit)%s\n' "${C_DIM}" "${INTERVAL}" "${C_RESET}"
   sleep "${INTERVAL}"
 done
