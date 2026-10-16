@@ -1,0 +1,5 @@
+# Configure Explicit `Pods` `scaleUp.policies` for Single-Step Wake-from-Zero
+
+`HorizontalPodAutoscaler/job-worker-hpa` defines an explicit `spec.behavior.scaleUp.policies` entry with `type: Pods`, `value: 10`, and `periodSeconds: 15` in `manifests/02-worker-and-hpa.yaml`.
+
+When Kubernetes HPA evaluates `scaleUp` behavior, its default policy is the maximum of `100%` of current replicas (`type: Percent, value: 100, periodSeconds: 15`) or `4` Pods (`type: Pods, value: 4, periodSeconds: 15`). When a workload is in the Zero-Scale State (`0` current replicas), `100%` of `0` evaluates to `0`, so the `Percent` policy contributes nothing on the wake-from-zero tick. Without an explicit `Pods` policy override, HPA caps the initial `0 -> N` scale-up step at `4` replicas and requires a second 15-second policy window to reach `5` or more replicas. Setting `type: Pods, value: 10, periodSeconds: 15` allows HPA to jump directly from `0` to `5` replicas in a single reconciliation cycle when a 100-item Job Burst arrives (`100 / 20 = 5`), up to `maxReplicas: 10`.
