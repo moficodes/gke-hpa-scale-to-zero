@@ -1,4 +1,5 @@
 docs/superpowers/
 .scratch/
+.worktrees/
 .DS_Store
 *.swp
