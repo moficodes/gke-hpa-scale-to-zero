@@ -1,6 +1,6 @@
 SHELL := /usr/bin/env bash
 
-KUBE_CONTEXT ?= $(shell kubectl config current-context 2>/dev/null || echo gke_mofilabs_us-central1-a_ate-cluster)
+KUBE_CONTEXT ?= $(shell kubectl config current-context 2>/dev/null)
 NAMESPACE ?= hpa-scale-to-zero
 JOBS ?= 100
 INTERVAL ?= 2

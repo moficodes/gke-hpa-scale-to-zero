@@ -6,7 +6,7 @@
 
 set -euo pipefail
 
-KUBE_CONTEXT="${KUBE_CONTEXT:-$(kubectl config current-context 2>/dev/null || echo "gke_mofilabs_us-central1-a_ate-cluster")}"
+KUBE_CONTEXT="${KUBE_CONTEXT:-$(kubectl config current-context 2>/dev/null || true)}"
 NAMESPACE="${NAMESPACE:-hpa-scale-to-zero}"
 INTERVAL="${INTERVAL:-2}"
 

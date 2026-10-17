@@ -18,7 +18,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
-KUBE_CONTEXT="${KUBE_CONTEXT:-$(kubectl config current-context 2>/dev/null || echo "gke_mofilabs_us-central1-a_ate-cluster")}"
+KUBE_CONTEXT="${KUBE_CONTEXT:-$(kubectl config current-context 2>/dev/null || true)}"
 NAMESPACE="hpa-scale-to-zero"
 EXPECTED_HPA_METRIC_NAME="autoscaling.gke.io|redis-queue-depth|pending-jobs"
 
